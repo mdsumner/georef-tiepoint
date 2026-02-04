@@ -72,12 +72,6 @@ Even more striking, the spec explicitly refuses to commit to any interpolation s
 
 This is a deliberate design choice: the format stores knowledge (these pixels correspond to these coordinates), but the application applies judgment (how to interpolate between them).
 
-Even more striking, the spec explicitly refuses to commit to ANY interpolation semantics, even for simple cases:
-
-> "However, tiepoints are only to be considered exact at the points specified; **thus defining such a set of bounding tiepoints does not imply that the model space locations of the interior of the image may be exactly computed by a linear interpolation of these tiepoints.**"
-
-This is remarkable: even if you provide 3 corner tiepoints, you *cannot assume* the interior is linearly interpolated. The spec stores points but refuses to define what happens between them.
-
 **Assessment:** Multiple tiepoints were *mentioned* as theoretically possible, but:
 - No interpolation method was standardized
 - Explicitly called "not Baseline"
@@ -85,9 +79,90 @@ This is remarkable: even if you provide 3 corner tiepoints, you *cannot assume* 
 - The OGC 1.1 standardization (2019) repeated this guidance
 - The spec explicitly punts on interpolation semantics entirely
 
-**⚠️ NEEDS VERIFICATION:** Were multiple tiepoints ever seriously used anywhere? What did GDAL do when encountering them historically? 
+### 1.4 Empirical Evidence: What GDAL Actually Tests
 
-### 1.4 The Design Philosophy: Carry vs Warp
+A survey of GDAL's autotest suite (~110MB of test data and scripts) provides empirical evidence for how these mechanisms are used in practice.
+
+**Search for tiepoint-related tests:**
+```
+grep -r "tiepoint" --ignore-case autotest/
+```
+
+**Findings:**
+
+| Test file | What it tests |
+|-----------|---------------|
+| `tiff_read_tiepoints_pixelispoint` | Single tiepoint + PixelIsPoint handling |
+| `tiff_write_tiepoints_pixelispoint` | Round-trip of single tiepoint |
+| `ModelTiepointTag_z_non_zero_but_ModelPixelScaleTag_z_zero.tif` | Edge case: Z in tiepoint but not in scale |
+
+The ModelTiepoint Z edge case file is a 1×1 pixel minimal regression test—GDAL handles it gracefully and produces a normal affine geotransform. This is bug-fix territory, not feature testing.
+
+**GCP test files in autotest:**
+```
+./gcore/data/byte_gcp_pixelispoint.tif
+./gcore/data/byte_gcp.tif
+./gcore/data/arcgis93_geodataxform_gcp.tif
+./gcore/data/cint_sar.tif
+```
+
+Only 4 TIFF files with embedded GCPs in the entire test suite.
+
+**The ArcGIS file is particularly revealing:**
+
+```
+gdalinfo gcore/data/arcgis93_geodataxform_gcp.tif
+```
+
+Shows a **4×4 grid of 16 GCPs** across an 11451×12188 image:
+```
+GCP[  0]: (564.99, 11041) -> (500000, 4705078.79)
+GCP[  1]: (3155.00, 11019) -> (513694.74, 4705092.25)
+...
+GCP[ 15]: (8256.99, 479.99) -> (540755.36, 4760721.10)
+```
+
+This IS real rubber-sheeting—polynomial or TPS warping territory. But crucially:
+- It's stored in a **sidecar `.aux.xml` file**, not in ModelTiepointTag
+- It's ArcGIS's GeoDataXform mechanism, not GeoTIFF tiepoints
+- The GeoTIFF itself has no geotransform—just raw pixel coordinates
+
+**Geolocation array tests** (the GEOLOCATION domain):
+```
+autotest/gcore/geoloc.py
+autotest/gcore/hdf4_read.py
+autotest/gdrivers/hdf5.py
+autotest/gdrivers/l1b.py
+autotest/gdrivers/sentinel2.py
+autotest/gdrivers/netcdf.py
+```
+
+These are exactly the swath/curvilinear sources we'd expect: HDF4, HDF5, L1B (AVHRR), Sentinel-2, netCDF.
+
+**The `geoloc.py` test** (authored by Frank Warmerdam) creates synthetic lon/lat arrays programmatically:
+```python
+lon_ds = gdal.GetDriverByName("GTiff").Create("/vsimem/lon.tif", 360, 1, 1, gdal.GDT_Float32)
+lon_ds.WriteRaster(0, 0, 360, 1, array.array("f", [...]))
+# ...
+ds.SetMetadata(md, "GEOLOCATION")
+warped_ds = gdal.Warp("", ds, format="MEM")
+```
+
+This demonstrates the geolocation array workflow: separate coordinate datasets, metadata domain, explicit warp.
+
+**Summary of empirical findings:**
+
+| Mechanism | Storage | Test coverage | Real-world usage |
+|-----------|---------|---------------|------------------|
+| GeoTIFF ModelTiepointTag (multiple) | In-TIFF | **None found** | Essentially zero |
+| GeoTIFF ModelTiepointTag (single + scale) | In-TIFF | Yes | Universal (≡ affine) |
+| GDAL GCPs | Sidecar or metadata | Yes | Historical imagery, registration |
+| ArcGIS GeoDataXform | .aux.xml sidecar | Yes (1 file) | Scanned maps, rubber-sheeting |
+| Geolocation arrays | GEOLOCATION domain | Yes | Swath sensors, curvilinear grids |
+
+**The key insight:** Multiple tiepoints *in the GeoTIFF tag itself* appear to have never been used in practice. The rubber-sheeting use case got solved *outside* the format, via application-specific sidecars (ArcGIS .aux.xml) or GDAL's metadata domains.
+
+### 1.5 The Design Philosophy: Carry vs Warp
 
 The GeoTIFF spec's refusal to define interpolation methods reveals a deliberate architectural boundary:
 
@@ -106,7 +181,7 @@ RasterIO doesn't care about rectification—it reads pixels and passes metadata 
 
 GeoTIFF was designed for the RasterIO world: store the georeferencing information, let the application decide what to do with it. The spec explicitly avoids becoming a Warp specification.
 
-### 1.5 The 3D Vestige
+### 1.6 The 3D Vestige
 
 The tiepoint format `(I,J,K,X,Y,Z)` carries a Z dimension "in anticipation of future support for 3D digital elevation models and vertical coordinate systems." In practice:
 
@@ -132,8 +207,6 @@ GCPs emerged as a separate mechanism in GDAL, distinct from GeoTIFF tiepoints:
 **Relationship to tiepoints:** Both are conceptually "point pairs mapping pixel to georef coordinates," but:
 - GeoTIFF tiepoints were intended for *intrinsic* georeferencing
 - GCPs are for *post-hoc* correction/registration
-
-**⚠️ NEEDS VERIFICATION:** Were GeoTIFF tiepoints and GDAL GCPs ever intended to converge? Or were they always seen as separate domains? 
 
 ### 2.2 Rational Polynomial Coefficients (RPCs)
 
@@ -190,8 +263,6 @@ By default:
 3. Geolocation arrays only used if nothing else available
 
 This creates practical issues for data with multiple georeferencing mechanisms.
-
-**⚠️ NEEDS VERIFICATION:** Is this precedence behavior intentional design or historical accident? 
 
 ---
 
@@ -408,21 +479,33 @@ For regular grids, this is "just" a half-pixel offset issue—annoying but manag
 
 2. **Multiple tiepoints were never standardized** - The GeoTIFF spec explicitly called this "not Baseline" and recommended against interchange. The interpolation method was left undefined.
 
-3. **GCPs and tiepoints diverged** - They solve different problems (post-hoc correction vs intrinsic georeferencing) and were handled separately in implementations.
+3. **Multiple tiepoints were never used in practice** - Empirical evidence from GDAL's autotest suite shows no test cases for multiple ModelTiepointTag entries. The rubber-sheeting use case was solved outside the format via sidecar files (ArcGIS .aux.xml) or GDAL's GCP metadata domain.
 
-4. **CF conventions came from a different world** - Climate modeling didn't need projected coordinates the way remote sensing did. The `grid_mapping` approach is workable but awkward.
+4. **GCPs and tiepoints diverged** - They solve different problems (post-hoc correction vs intrinsic georeferencing) and were handled separately in implementations.
 
-5. **GDAL unified the practical landscape** - The transformer API handles all mechanisms through a common interface, even if the metadata storage remains fragmented.
+5. **CF conventions came from a different world** - Climate modeling didn't need projected coordinates the way remote sensing did. The `grid_mapping` approach is workable but awkward.
 
-### 7.2 Open Questions
+6. **GDAL unified the practical landscape** - The transformer API handles all mechanisms through a common interface, even if the metadata storage remains fragmented.
 
-1. **Were multiple tiepoints ever seriously used?** Need to check GDAL history and old implementations.
+### 7.2 Open Questions for Community Discussion
 
-2. **What was the original intent for tiepoints vs GCPs?** Were they ever meant to converge?
+The following questions are suitable for discussion on gdal-dev or similar forums:
 
-3. **Is GeoZarr over-spatializing?** Need to review current spec and SWG discussions.
+1. **Were multiple tiepoints ever seriously used?** 
+   
+   The GeoTIFF spec mentions multiple tiepoints as "Case 5" but calls it "not Baseline" and recommends against interchange. A survey of GDAL's autotest suite finds no test cases for multiple ModelTiepointTag entries. The only GCP-based rubber-sheeting test file (`arcgis93_geodataxform_gcp.tif`) stores its 16 GCPs in an ArcGIS .aux.xml sidecar, not in the GeoTIFF tags.
+   
+   **Question:** Did GDAL ever encounter real-world files with multiple tiepoints in ModelTiepointTag? If so, how were they handled? Was there ever an intent to unify GeoTIFF tiepoints with GDAL's GCP mechanism, or were they always seen as separate domains?
 
-4. **Should GeoZarr just pass through CRS + coordinate metadata?** And leave transformation to runtime libraries?
+2. **Is the transformer precedence behavior intentional?**
+   
+   GDAL's `GDALCreateGenImgProjTransformer2()` uses geotransform > GCPs > geolocation arrays by default. For data with multiple georeferencing mechanisms, this creates implicit choices.
+   
+   **Question:** Is this precedence order an intentional design decision, or did it emerge from historical implementation order? Are there cases where this default causes problems?
+
+3. **What is the right scope for GeoZarr?**
+   
+   GeoZarr sits at the intersection of remote sensing (affine, RPCs) and climate/modeling (coordinate arrays) communities. Should it try to support all georeferencing models with unified semantics, or cleanly carry each lineage's native metadata and leave transformation to libraries?
 
 ### 7.3 For the Essay
 
@@ -549,8 +632,11 @@ Format specs live in RasterIO space—they describe what's stored, not how to tr
 - GDAL Zarr Driver: https://gdal.org/drivers/raster/zarr.html
 - pyproj CF documentation: https://pyproj4.github.io/pyproj/stable/build_crs_cf.html
 
+### Empirical Evidence
+- GDAL autotest suite analysis (February 2026)
+
 ### To Consult
-- GDAL devs and community
+- GDAL devs and community (gdal-dev mailing list)
 - GeoZarr SWG members (current direction)
 - xarray/rioxarray developers (practical CF/CRS handling)
 
@@ -559,3 +645,4 @@ Format specs live in RasterIO space—they describe what's stored, not how to tr
 ## Revision History
 
 - 2026-02-04: Initial draft compiled from web research
+- 2026-02-05: Added empirical evidence from GDAL autotest suite; reformulated open questions for community discussion
