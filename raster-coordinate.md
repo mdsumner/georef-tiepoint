@@ -2,7 +2,7 @@
 
 ## Status: DRAFT FOR REVIEW AND EXPANSION
 **Author:** Michael Sumner (AAD)  
-**Reviewer checklist:** GDAL devs, xarray/CF community  
+**Reviewer checklist:** GDAL devs and community, xarray/CF community  
 **Last updated:** February 2026
 
 ---
@@ -137,15 +137,21 @@ GCPs emerged as a separate mechanism in GDAL, distinct from GeoTIFF tiepoints:
 
 ### 2.2 Rational Polynomial Coefficients (RPCs)
 
-RPCs became the satellite vendor's solution for the sensor-model problem. GDAL RFC 22 (circa 2006-2007?) added formal RPC support:
+RPCs represent a paradigm shift from geometric correction to a **Universal Sensor Model**. Instead of sharing complex physical camera parameters (focal length, sensor pitch, orbital ephemeris), vendors provide a "black box" polynomial that maps (Lat, Lon, Height) → (Row, Col).
+
+GDAL RFC 22 (circa 2006-2007?) added formal RPC support:
 
 - Stored as metadata in the "RPC" domain
 - Describe the physical relationship between image coordinates and ground coordinates via rational polynomials
-- Support orthorectification with DEM
+- **Fundamentally 3D**: RPCs *require* a DEM (Digital Elevation Model) to resolve the pixel↔coordinate mapping
 
-**Key products using RPCs:** GeoEye, DigitalGlobe, SPOT (some products)
+**Critical distinction:** Unlike an affine transform where you can compute coordinates from pixel location alone, RPC evaluation is underdetermined without elevation. You cannot "know" where a pixel is in an RPC model without knowing the ground height at that location.
+
+**Key products using RPCs:** GeoEye, DigitalGlobe, SPOT (some products), Pléiades, WorldView
 
 **Source:** GDAL RFC 22: RPC Georeferencing
+
+**Implication for format specs:** If GeoZarr tries to "support RPCs," it must also specify how to handle DEM dependency—which is deep into transformation engine territory, not format metadata.
 
 ### 2.3 Geolocation Arrays
 
@@ -306,16 +312,20 @@ GeoZarr sits at the intersection of two communities with different assumptions:
 
 Trying to generalize across both by adding more transformation machinery to the spec conflates these use cases. The CF world doesn't need GCP support—they have coordinate arrays that completely describe their grids. The remote sensing world doesn't need 2D auxiliary coordinates for rectified products—they have geotransforms and RPCs.
 
-**What GeoZarr *should* do (hypothesis):**
+**What GeoZarr *should* do—be a "Container of Intent":**
 - Pass through CRS information cleanly (WKT2, PROJJSON)
 - Pass through coordinate arrays or geotransform metadata
+- Carry each georeferencing lineage's native metadata without trying to unify them
 - Let reading libraries (GDAL, rioxarray, pyresample) handle the transformation logic
 - Acknowledge two conformance classes with different assumptions rather than trying to unify them
 
+The format should be a **description of state**, not a **transformation of state**. A format stores the "what and where"; a warper implements the "how to transform."
+
 **What GeoZarr should NOT do:**
 - Define interpolation methods for non-affine transformations
-- Specify what readers should do when they encounter GCPs or RPCs  
+- Specify what readers should do when they encounter GCPs or RPCs
 - Try to standardize warping semantics
+- Force RPCs into an affine-like structure (losing precision the remote sensing community requires)
 
 The GeoTIFF spec got this right by explicitly putting interpolation "out of scope." GeoZarr should follow suit.
 
@@ -325,17 +335,28 @@ The GeoTIFF spec got this right by explicitly putting interpolation "out of scop
 
 ## 6. The Spectrum of Coordinate Reference Models
 
-### 6.1 A Taxonomy
+### 6.1 A Taxonomy of Georeferencing Models
 
-From simplest to most complex:
+The four major approaches to georeferencing, with their distinguishing characteristics:
 
-1. **Bbox** - `xmin, ymin, xmax, ymax` + image dimensions → assumes axis-aligned, north-up
-2. **Offset + scale** - origin point + pixel size → single tiepoint + scale equivalent
-3. **6-parameter affine** - handles rotation and shear
-4. **GCPs + polynomial** - sparse points, fitted transformation
-5. **GCPs + TPS** - sparse points, exact interpolation
-6. **RPCs** - rational polynomial sensor model
-7. **Geolocation arrays** - full or subsampled lat/lon per pixel
+| Model | Math | Dimensionality | Determinism | Data Weight | Typical Source |
+|-------|------|----------------|-------------|-------------|----------------|
+| **Affine** | 6 parameters | 2D | Fully determined | Negligible | Rectified imagery, map products |
+| **GCPs** | Sparse point pairs + interpolation | 2D | Interpolation-dependent | Light | Manual registration, historical imagery |
+| **RPCs** | Rational polynomials | **3D (requires DEM)** | Determined given elevation | Light + DEM | Satellite vendors (DigitalGlobe, Pléiades) |
+| **Geolocation Arrays** | Explicit coordinate per pixel | 2D (can encode 3D) | Fully determined | Heavy | Swath sensors (AVHRR, MODIS), model output |
+
+**Key distinctions:**
+
+- **Affine**: Simple, fast, universal. The "goal state" for rectified products. Math is trivial; any reader can implement it.
+
+- **GCPs**: Human-intervened, inherently ambiguous. The *same* set of GCPs can produce different results depending on polynomial order, TPS vs polynomial, outlier handling. This is why GeoTIFF punted on specifying interpolation—there's no single right answer.
+
+- **RPCs**: Mathematically sophisticated, but fundamentally incomplete without a DEM. You cannot evaluate an RPC model without external elevation data. This makes RPCs categorically different from the others—they're not self-contained georeferencing.
+
+- **Geolocation Arrays**: Brute-force but unambiguous. Every pixel has explicit coordinates. The "cost" is data volume; the "benefit" is that curvilinear grids are represented exactly as the sensor/model produced them.
+
+**The format design question:** Should a format spec try to support all four models with unified semantics? Or should it cleanly carry each model's native metadata and leave interpretation to libraries?
 
 ### 6.2 What Each Format Actually Supports
 
@@ -355,6 +376,27 @@ Neither GeoTIFF nor Zarr/CF elegantly handles:
 - Progressive refinement
 
 **GDAL handles all of these at runtime** but the metadata storage is fragmented.
+
+### 6.4 Cell Semantics: The Half-Pixel Demon and Beyond
+
+GeoTIFF's `GTRasterTypeGeoKey` distinguishes PixelIsPoint (coordinates reference cell centers) from PixelIsArea (coordinates reference cell corners). This maps imperfectly to CF conventions:
+
+**CF's `bounds` convention:**
+```
+float lat(y);
+float lat_bounds(y, 2);  // explicit cell edges
+```
+
+**CF's corner arrays for curvilinear grids:**
+```
+float lat_corners(y_corners, x_corners);  // dimensions are (ny+1, nx+1)
+```
+
+For regular grids, this is "just" a half-pixel offset issue—annoying but manageable. For irregular rectilinear grids (e.g., ocean models with varying layer thickness) or curvilinear grids, the (n+1) corner coordinates are the *natural* representation of cell boundaries.
+
+**The problem:** CF datasets often imply corner-based referencing without explicit specification. Sometimes corner arrays are simply redundant storage of regular edge coordinates in [n × 2] form. The semantics are underspecified, and different readers make different assumptions.
+
+**For GeoZarr:** This is another case where the format should cleanly carry the metadata (bounds arrays, corner coordinates, pixel-is-point flags) without trying to normalize across conventions. The semantic interpretation belongs in the reading library.
 
 ---
 
@@ -392,7 +434,11 @@ Neither GeoTIFF nor Zarr/CF elegantly handles:
 
 **GDAL's role:** The de facto standard that papers over format differences, but this creates implicit dependencies that format specs don't capture.
 
-**The way forward:** Format specs should be minimal (store CRS and coordinate metadata cleanly) and leave transformation semantics to libraries. GeoZarr should resist the temptation to re-specify transformation methods.
+**The way forward:** GeoZarr should be a **"Container of Intent"**—a standardized way to carry the divergent georeferencing lineages (Affine, RPC, Geolocation Arrays) cleanly, without trying to merge them into a single unified model or specify transformation semantics. The format stores the metadata; libraries interpret it.
+
+If GeoZarr tries to force an RPC model into a "Zarr-native" affine-like structure, or specifies how to interpolate GCPs, or defines what readers should do with geolocation arrays, it will lose the precision required by the remote sensing community while adding complexity the climate community doesn't need.
+
+**Note for future exploration:** GDAL's GTI (GDAL Tile Index) format offers a potentially more efficient approach than VRT for managing collections of georeferenced assets—worth examining as an alternative to STAC-level indirection for tiled/mosaicked datasets.
 
 ---
 
