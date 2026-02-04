@@ -185,7 +185,7 @@ By default:
 
 This creates practical issues for data with multiple georeferencing mechanisms.
 
-**⚠️ NEEDS VERIFICATION:** Is this precedence behavior intentional design or historical accident? (Ask Even)
+**⚠️ NEEDS VERIFICATION:** Is this precedence behavior intentional design or historical accident? 
 
 ---
 
